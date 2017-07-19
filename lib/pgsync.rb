@@ -1,3 +1,4 @@
+require 'byebug'
 require "pgsync/version"
 require "yaml"
 require "slop"
@@ -35,7 +36,7 @@ module PgSync
       start_time = Time.now
 
       args, opts = @arguments, @options
-      [:to, :from, :to_safe, :exclude].each do |opt|
+      [:to, :from, :to_safe, :exclude, :from_schema, :to_schema].each do |opt|
         opts[opt] ||= config[opt.to_s]
       end
       command = args[0]
@@ -80,11 +81,11 @@ module PgSync
 
         source = parse_source(opts[:from])
         abort "No source" unless source
-        source_uri, from_schema = parse_uri(source)
+        source_uri, from_schema = parse_uri(source, opts[:from_schema])
 
         destination = parse_source(opts[:to])
         abort "No destination" unless destination
-        destination_uri, to_schema = parse_uri(destination)
+        destination_uri, to_schema = parse_uri(destination, opts[:to_schema])
         abort "Danger! Add `to_safe: true` to `.pgsync.yml` if the destination is not localhost or 127.0.0.1" unless %(localhost 127.0.0.1).include?(destination_uri.host) || opts[:to_safe]
 
         print_uri("From", source_uri)
@@ -97,11 +98,16 @@ module PgSync
 
         if opts[:schema_only]
           log "* Dumping schema"
-          tables = tables.keys.map { |t| "-t #{t}" }.join(" ")
+          tables = tables.keys.map { |t| "-t #{from_schema}.#{t}" }.join(" ")
           psql_version = Gem::Version.new(`psql --version`.lines[0].chomp.split(" ")[-1])
+
           if_exists = psql_version >= Gem::Version.new("9.4.0")
           dump_command = "pg_dump -Fc --verbose --schema-only --no-owner --no-acl #{tables} #{to_url(source_uri)}"
-          restore_command = "pg_restore --verbose --no-owner --no-acl --clean #{if_exists ? "--if-exists" : nil} -d #{to_url(destination_uri)}"
+          #restore_command = "pg_restore --verbose --no-owner --no-acl --clean #{if_exists ? "--if-exists" : nil} -d #{to_url(destination_uri)}"
+          restore_command = "pg_restore --schema #{to_schema} --verbose --no-owner --no-acl --clean #{if_exists ? "--if-exists" : nil} -d #{to_url(destination_uri)}"
+          puts "========================="
+          puts "======command============"
+          puts "#{dump_command} | #{restore_command}"
           system("#{dump_command} | #{restore_command}")
 
           log_completed(start_time)
@@ -147,8 +153,10 @@ module PgSync
               extra_fields = to_fields - from_fields
               missing_fields = from_fields - to_fields
 
-              from_sequences = sequences(from_connection, table, shared_fields)
-              to_sequences = sequences(to_connection, table, shared_fields)
+              #from_sequences = sequences(from_connection, table, shared_fields)
+              #to_sequences = sequences(to_connection, table, shared_fields)
+              from_sequences = sequences(from_connection, table, shared_fields, from_schema)
+              to_sequences = sequences(to_connection, table, shared_fields, to_schema)
               shared_sequences = to_sequences & from_sequences
               extra_sequences = to_sequences - from_sequences
               missing_sequences = from_sequences - to_sequences
@@ -263,8 +271,10 @@ module PgSync
                      file.unlink
                   end
                 else
-                  to_connection.exec("TRUNCATE #{table} CASCADE")
-                  to_connection.copy_data "COPY #{table} (#{fields}) FROM STDIN" do
+                  #to_connection.exec("TRUNCATE #{table} CASCADE")
+                  to_connection.exec("TRUNCATE #{to_schema}.#{table} CASCADE")
+                  #to_connection.copy_data "COPY #{table} (#{fields}) FROM STDIN" do
+                  to_connection.copy_data "COPY #{to_schema}.#{table} (#{fields}) FROM STDIN" do
                     from_connection.copy_data copy_to_command do
                       while row = from_connection.get_copy_data
                         to_connection.put_copy_data(row)
@@ -296,6 +306,8 @@ Options:}
         o.string "-d", "--db", "database"
         o.string "--from", "source"
         o.string "--to", "destination"
+        o.string "--from_schema", "from_schema"
+        o.string "--to_schema", "to_schema"
         o.string "--where", "where", help: false
         o.integer "--limit", "limit", help: false
         o.string "--exclude", "exclude tables"
@@ -498,14 +510,15 @@ Options:}
       end
     end
 
-    def parse_uri(url)
+    def parse_uri(url, schema=nil)
       uri = URI.parse(url)
       uri.scheme ||= "postgres"
       uri.host ||= "localhost"
       uri.port ||= 5432
       uri.path = "/#{uri.path}" if uri.path && uri.path[0] != "/"
-      schema = CGI.parse(uri.query.to_s)["schema"][0] || "public"
-      [uri, schema]
+      schema ||= ((uri.query && CGI::parse(uri.query)["schema"]) || [])[0]
+      puts "==get schema: #{schema} from #{url} "
+      [uri, schema || "public"]
     end
 
     def print_uri(prefix, uri)
@@ -552,8 +565,8 @@ Options:}
       $stderr.puts message
     end
 
-    def sequences(conn, table, columns)
-      conn.exec("SELECT #{columns.map { |f| "pg_get_serial_sequence(#{escape(table)}, #{escape(f)}) AS #{f}" }.join(", ")}").to_a[0].values.compact
+    def sequences(conn, table, columns, in_schema=nil)
+      conn.exec("SELECT #{columns.map { |f| "pg_get_serial_sequence(#{escape("#{in_schema}.#{table}")}, #{escape(f)}) AS #{f}" }.join(", ")}").to_a[0].values.compact
     end
 
     def in_parallel(tables, &block)
